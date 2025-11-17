@@ -11,6 +11,7 @@ import json
 import bcrypt
 from typing import Optional
 from typing import List
+import logging
 
 
 
@@ -225,7 +226,7 @@ def generate_assistant_reply_from_ollama(user_id: int, user_content: str, model_
     })
 
     payload = {
-        "model": OLLAMA_MODEL,
+        "model": model_name,
         "messages": messages_for_ollama,
         "stream": False  # чтобы получить один JSON, а не поток
     }
@@ -342,6 +343,8 @@ def chat_send(req: ChatSendRequest):
         )
 
     model_name = user["preferred_model"] or OLLAMA_MODEL
+
+    logger.info(f"[chat_send] user_id=%s model=%s", req.user_id, model_name)
 
     # 1. Сохраняем сообщение пользователя
     user_row = add_message(
