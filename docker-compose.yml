@@ -1,0 +1,53 @@
+services:
+  db:
+    image: postgres:16
+    container_name: alabuga_chat_db
+    environment:
+      POSTGRES_USER: alabuga_app
+      POSTGRES_PASSWORD: alabuga_password
+      POSTGRES_DB: alabuga_chat
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./postgres_data:/var/lib/postgresql/data
+    networks:
+      - alabuga_chat_net
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: alabuga_chat_pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    depends_on:
+      - db
+    networks:
+      - alabuga_chat_net
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: alabuga_chat_api
+    environment:
+      DB_USER: alabuga_app
+      DB_PASSWORD: alabuga_password
+      DB_NAME: alabuga_chat
+      DB_HOST: db
+      DB_PORT: 5432
+      OLLAMA_BASE_URL: "http://host.docker.internal:11434/api"
+      OLLAMA_MODEL: "granite32-vision-2b-4g"
+    ports:
+      - "8015:8015"
+    depends_on:
+      - db
+    networks:
+      - alabuga_chat_net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+networks:
+  alabuga_chat_net:
+    driver: bridge
