@@ -8,6 +8,11 @@ from typing import List
 import os
 import requests
 import json
+import bcrypt
+from typing import Optional
+from typing import List
+
+
 
 class UserCreate(BaseModel):
     email: EmailStr
@@ -24,6 +29,9 @@ class UserResponse(BaseModel):
     id: int
     email: EmailStr
     display_name: str
+    streaming_enabled: bool
+    preferred_model: Optional[str] = None
+
 
 class Message(BaseModel):
     id: int
@@ -46,6 +54,9 @@ class ChatSendResponse(BaseModel):
     user_message: Message
     assistant_message: Message
 
+class ModelsListResponse(BaseModel):
+    models: List[str]
+
 
 app = FastAPI()
 
@@ -63,12 +74,40 @@ engine = create_engine(DATABASE_URL, echo=False, future=True)
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/api")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "granite32-vision-2b-4g") 
 
+# Encrypt passes helpers
+
+def hash_password(password: str) -> str:
+    """
+    Возвращает bcrypt-хэш пароля (строка для записи в БД).
+    """
+    salt = bcrypt.gensalt()
+    hashed = bcrypt.hashpw(password.encode("utf-8"), salt)
+    return hashed.decode("utf-8")
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """
+    Проверяет, соответствует ли plain-пароль сохранённому bcrypt-хэшу.
+    """
+    try:
+        return bcrypt.checkpw(
+            plain_password.encode("utf-8"),
+            hashed_password.encode("utf-8")
+        )
+    except Exception:
+        return False
+
+
 # ========= DB FUNCs ==========
 
 # ========= USER FUNCs: START ==========
 # take user by name
 def get_user_by_email(email: str):
-    query = text("SELECT id, email, display_name, password_hash FROM users WHERE email = :email")
+    query = text("""
+        SELECT id, email, display_name, password_hash, streaming_enabled, preferred_model
+        FROM users
+        WHERE email = :email
+    """)
     with engine.connect() as conn:
         result = conn.execute(query, {"email": email})
         row = result.mappings().first()
@@ -76,16 +115,15 @@ def get_user_by_email(email: str):
 
 # REGISTRATION
 def create_user(user: UserCreate):
-    # В проде надо обязательно хранить ХЕШ (bcrypt и т.п.).
     query = text("""
         INSERT INTO users (email, display_name, password_hash)
         VALUES (:email, :display_name, :password_hash)
-        RETURNING id, email, display_name
+        RETURNING id, email, display_name, streaming_enabled, preferred_model
     """)
     params = {
         "email": user.email,
         "display_name": user.display_name,
-        "password_hash": user.password,  # TODO hash_password(user.password)
+        "password_hash": hash_password(user.password),  # стало так
     }
     with engine.connect() as conn:
         result = conn.execute(query, params)
@@ -93,10 +131,11 @@ def create_user(user: UserCreate):
         row = result.mappings().first()
         return row
 
+
 # LOGIN
 def verify_user_credentials(email: str, password: str):
     query = text("""
-        SELECT id, email, display_name, password_hash
+        SELECT id, email, display_name, password_hash, streaming_enabled, preferred_model
         FROM users
         WHERE email = :email
     """)
@@ -105,9 +144,11 @@ def verify_user_credentials(email: str, password: str):
         row = result.mappings().first()
         if row is None:
             return None
-        # сравниваем пароль напрямую; в проде сравнивался бы хеш
-        if row["password_hash"] != password:
+
+        stored_hash = row["password_hash"]
+        if not verify_password(password, stored_hash):
             return None
+
         return row
 # ========= USER FUNCs: END ==========
 
@@ -147,7 +188,11 @@ def add_message(user_id: int, role: str, content: str):
 # User check
 def get_user_by_id(user_id: int):
     # Проверям пользователя, чтобы не писать чат в несуществующего пользователя и не ловить ошибку БД
-    query = text("SELECT id, email, display_name FROM users WHERE id = :id")
+    query = text("""
+        SELECT id, email, display_name, streaming_enabled, preferred_model
+        FROM users
+        WHERE id = :id
+    """)
     with engine.connect() as conn:
         result = conn.execute(query, {"id": user_id})
         row = result.mappings().first()
@@ -156,7 +201,7 @@ def get_user_by_id(user_id: int):
 # ========= CHAT FUNCs: END ==========
 
 # ========= OLLAMA FUNCs: START ==========
-def generate_assistant_reply_from_ollama(user_id: int, user_content: str) -> str:
+def generate_assistant_reply_from_ollama(user_id: int, user_content: str, model_name: str) -> str:
     """
     Вызывает Ollama /api/chat с историей диалога + новым сообщением.
     Возвращает текст ответа модели.
@@ -239,7 +284,9 @@ def register(user: UserCreate):
     return UserResponse(
         id=row["id"],
         email=row["email"],
-        display_name=row["display_name"]
+        display_name=row["display_name"],
+        streaming_enabled=row["streaming_enabled"],
+        preferred_model=row["preferred_model"]
     )
 
 
@@ -255,7 +302,9 @@ def login(data: UserLogin):
     return UserResponse(
         id=row["id"],
         email=row["email"],
-        display_name=row["display_name"]
+        display_name=row["display_name"],
+        streaming_enabled=row["streaming_enabled"],
+        preferred_model=row["preferred_model"]
     )
 
 @app.get("/chat/history", response_model=ChatHistoryResponse)
@@ -292,6 +341,8 @@ def chat_send(req: ChatSendRequest):
             detail="Пользователь не найден"
         )
 
+    model_name = user["preferred_model"] or OLLAMA_MODEL
+
     # 1. Сохраняем сообщение пользователя
     user_row = add_message(
         user_id=req.user_id,
@@ -302,7 +353,8 @@ def chat_send(req: ChatSendRequest):
     # 2. Получаем ответ от модели Ollama с учётом контекста
     assistant_text = generate_assistant_reply_from_ollama(
         user_id=req.user_id,
-        user_content=req.content
+        user_content=req.content,
+        model_name=model_name
     )
 
     # 3. Сохраняем ответ ассистента
@@ -344,6 +396,8 @@ def chat_send_stream(req: ChatSendRequest):
             detail="Пользователь не найден"
         )
 
+    model_name = user["preferred_model"] or OLLAMA_MODEL
+
     # Сохраняем сообщение пользователя сразу
     user_row = add_message(
         user_id=req.user_id,
@@ -369,7 +423,7 @@ def chat_send_stream(req: ChatSendRequest):
         })
 
         payload = {
-            "model": OLLAMA_MODEL,
+            "model": model_name,
             "messages": messages_for_ollama,
             "stream": True,
                 "options": {
@@ -437,3 +491,52 @@ def chat_send_stream(req: ChatSendRequest):
         }) + "\n"
 
     return StreamingResponse(event_stream(), media_type="application/json")
+
+
+class UserSettingsUpdate(BaseModel):
+    streaming_enabled: bool
+    preferred_model: str
+
+
+@app.patch("/users/{user_id}/settings", response_model=UserResponse)
+def update_user_settings(user_id: int, payload: UserSettingsUpdate):
+    user = get_user_by_id(user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+
+    query = text("""
+        UPDATE users
+        SET streaming_enabled = :streaming_enabled,
+            preferred_model = :preferred_model
+        WHERE id = :id
+        RETURNING id, email, display_name, streaming_enabled, preferred_model
+    """)
+
+    with engine.connect() as conn:
+        result = conn.execute(query, {
+            "id": user_id,
+            "streaming_enabled": payload.streaming_enabled,
+            "preferred_model": payload.preferred_model
+        })
+        conn.commit()
+        row = result.mappings().first()
+
+    return UserResponse(
+        id=row["id"],
+        email=row["email"],
+        display_name=row["display_name"],
+        streaming_enabled=row["streaming_enabled"],
+        preferred_model=row["preferred_model"]
+    )
+
+@app.get("/models/names", response_model=ModelsListResponse)
+def list_model_names():
+    try:
+        resp = requests.get(f"{OLLAMA_BASE_URL}/tags", timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        # Структура обычно: {"models": [{ "name": "llama3", ... }, ...]}
+        names = [m["name"] for m in data.get("models", [])]
+        return ModelsListResponse(models=names)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка получения списка моделей: {e}")
